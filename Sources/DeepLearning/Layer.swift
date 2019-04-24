@@ -16,39 +16,12 @@
 @_exported import TensorFlow
 #endif
 
-/// A value that indicates either a training phase or an inference phase for a layer.
-public enum LearningPhase {
-    case training
-    case inference
-}
-
-/// A context that stores contextual information used for the application of layers.
-open class Context {
-    /// The current learning phase.
-    public var learningPhase: LearningPhase
-
-    /// Creates a context.
-    ///
-    /// - Parameter learningPhase: The current learning phase.
-    public required init(learningPhase: LearningPhase) {
-        self.learningPhase = learningPhase
-    }
-
-    /// Creates a context by copying all information from an existing context.
-    ///
-    /// - Parameter context: The existing context to copy from.
-    public required init(_ other: Context) {
-        self.learningPhase = other.learningPhase
-    }
-}
-
 /// A neural network layer.
 ///
 /// Types that conform to `Layer` represent functions that map inputs to outputs. They may have an
 /// internal state represented by parameters, such as weight tensors.
 ///
-/// `Layer` instances define a differentiable `applied(to:in:)` method for mapping inputs to
-/// outputs.
+/// `Layer` instances define a differentiable call method for mapping inputs to outputs.
 public protocol Layer: Differentiable & KeyPathIterable
     where AllDifferentiableVariables: KeyPathIterable {
     /// The input type of the layer.
@@ -58,31 +31,36 @@ public protocol Layer: Differentiable & KeyPathIterable
 
     /// Returns the output obtained from applying the layer to the given input.
     ///
-    /// - Parameters:
-    ///   - input: The input to the layer.
-    ///   - context: The contextual information for the layer application, e.g. the current learning
-    ///     phase.
+    /// - Parameter input: The input to the layer.
     /// - Returns: The output.
     @differentiable
-    func applied(to input: Input, in context: Context) -> Output
+    func call(_ input: Input) -> Output
 }
 
 public extension Layer {
-    @available(*, deprecated,
-               message: "Switch to 'applied(to:in:)' for training, or 'inferring(from:)' for inference")
-    func applied(to input: Input) -> Output {
-        return inferring(from: input)
-    }
-
     /// Returns the inference output obtained from applying the layer to the given input.
     ///
     /// - Parameter input: The input to the layer.
     /// - Returns: The inference output.
     @differentiable
     func inferring(from input: Input) -> Output {
-        let context = Context(learningPhase: .inference)
-        return applied(to: input, in: context)
+        return withLearningPhase(LearningPhase.inference) { self(input) }
     }
+
+    // TODO(rxwei): Remove this custom VJP once differentiation supports currying.
+    @differentiating(inferring(from:))
+    @usableFromInline
+    internal func _vjpInferring(from input: Input)
+        -> (value: Output, pullback: (Output.CotangentVector)
+            -> (CotangentVector, Input.CotangentVector)) {
+        return withLearningPhase(LearningPhase.inference) {
+            let (output, pullback) = appliedForBackpropagation(to: input)
+            return (output, { v in pullback(v) })
+        }
+    }
+
+    typealias Backpropagator = (_ direction: Output.CotangentVector)
+        -> (layerGradient: CotangentVector, inputGradient: Input.CotangentVector)
 
     /// Returns the inference output and the backpropagation function obtained from applying the
     /// layer to the given input.
@@ -91,12 +69,10 @@ public extension Layer {
     /// - Returns: A tuple containing the output and the backpropagation function. The
     ///   backpropagation function (a.k.a. backpropagator) takes a direction vector and returns the
     ///   gradients at the layer and at the input, respectively.
-    func appliedForBackpropagation(to input: Input, in context: Context)
-        -> (output: Output,
-            backpropagator: (_ direction: Output.CotangentVector)
-                -> (layerGradient: CotangentVector, inputGradient: Input.CotangentVector)) {
+    func appliedForBackpropagation(to input: Input)
+        -> (output: Output, backpropagator: Backpropagator) {
         let (out, pullback) = valueWithPullback(at: input) { layer, input in
-            return layer.applied(to: input, in: context)
+            return layer(input)
         }
         return (out, pullback)
     }
@@ -107,49 +83,36 @@ public extension Differentiable {
     /// except that the first layer's input is `self`.
     ///
     /// - Parameters:
-    ///   - context: The context that stores contextual information used for the application of
-    ///     layers.
     ///   - l1: The first layer.
     ///   - l2: The second layer.
     /// - Returns: The final layer's output after sequential application.
     @differentiable
-    func sequenced<L1: Layer, L2: Layer>(
-        in context: Context, through l1: L1, _ l2: L2)
-        -> L2.Output
-            where L1.Input == Self,
-                  L1.Output == L2.Input {
-        let o1 = l1.applied(to: self, in: context)
-        return l2.applied(to: o1, in: context)
+    func sequenced<L1: Layer, L2: Layer>(through l1: L1, _ l2: L2) -> L2.Output
+        where L1.Input == Self, L1.Output == L2.Input {
+        let o1 = l1(self)
+        return l2(o1)
     }
 
     /// Returns the output computed by applying a sequence of layers to the previous layer's output,
     /// except that the first layer's input is `self`.
     ///
     /// - Parameters:
-    ///   - context: The context that stores contextual information used for the application of
-    ///     layers.
     ///   - l1: The first layer.
     ///   - l2: The second layer.
     ///   - l3: The third layer.
     /// - Returns: The final layer's output after sequential application.
     @differentiable
-    func sequenced<L1: Layer, L2: Layer, L3: Layer>(
-        in context: Context, through l1: L1, _ l2: L2, _ l3: L3)
-        -> L3.Output
-            where L1.Input == Self,
-                  L1.Output == L2.Input,
-                  L2.Output == L3.Input {
-        let o1 = l1.applied(to: self, in: context)
-        let o2 = l2.applied(to: o1, in: context)
-        return l3.applied(to: o2, in: context)
+    func sequenced<L1: Layer, L2: Layer, L3: Layer>(through l1: L1, _ l2: L2, _ l3: L3) -> L3.Output
+        where L1.Input == Self, L1.Output == L2.Input, L2.Output == L3.Input {
+        let o1 = l1(self)
+        let o2 = l2(o1)
+        return l3(o2)
     }
 
     /// Returns the output computed by applying a sequence of layers to the previous layer's output,
     /// except that the first layer's input is `self`.
     ///
     /// - Parameters:
-    ///   - context: The context that stores contextual information used for the application of
-    ///     layers.
     ///   - l1: The first layer.
     ///   - l2: The second layer.
     ///   - l3: The third layer.
@@ -157,24 +120,20 @@ public extension Differentiable {
     /// - Returns: The final layer's output after sequential application.
     @differentiable
     func sequenced<L1: Layer, L2: Layer, L3: Layer, L4: Layer>(
-        in context: Context, through l1: L1, _ l2: L2, _ l3: L3, _ l4: L4)
-        -> L4.Output
-            where L1.Input == Self,
-                  L1.Output == L2.Input,
-                  L2.Output == L3.Input,
-                  L3.Output == L4.Input {
-        let o1 = l1.applied(to: self, in: context)
-        let o2 = l2.applied(to: o1, in: context)
-        let o3 = l3.applied(to: o2, in: context)
-        return l4.applied(to: o3, in: context)
+        through l1: L1, _ l2: L2, _ l3: L3, _ l4: L4
+    ) -> L4.Output
+        where L1.Input == Self, L1.Output == L2.Input, L2.Output == L3.Input,
+              L3.Output == L4.Input {
+        let o1 = l1(self)
+        let o2 = l2(o1)
+        let o3 = l3(o2)
+        return l4(o3)
     }
 
     /// Returns the output computed by applying a sequence of layers to the previous layer's output,
     /// except that the first layer's input is `self`.
     ///
     /// - Parameters:
-    ///   - context: The context that stores contextual information used for the application of
-    ///     layers.
     ///   - l1: The first layer.
     ///   - l2: The second layer.
     ///   - l3: The third layer.
@@ -183,26 +142,21 @@ public extension Differentiable {
     /// - Returns: The final layer's output after sequential application.
     @differentiable
     func sequenced<L1: Layer, L2: Layer, L3: Layer, L4: Layer, L5: Layer>(
-        in context: Context, through l1: L1, _ l2: L2, _ l3: L3, _ l4: L4, _ l5: L5)
-        -> L5.Output
-            where L1.Input == Self,
-                  L1.Output == L2.Input,
-                  L2.Output == L3.Input,
-                  L3.Output == L4.Input,
-                  L4.Output == L5.Input {
-        let o1 = l1.applied(to: self, in: context)
-        let o2 = l2.applied(to: o1, in: context)
-        let o3 = l3.applied(to: o2, in: context)
-        let o4 = l4.applied(to: o3, in: context)
-        return l5.applied(to: o4, in: context)
+        through l1: L1, _ l2: L2, _ l3: L3, _ l4: L4, _ l5: L5
+    ) -> L5.Output
+        where L1.Input == Self, L1.Output == L2.Input, L2.Output == L3.Input, L3.Output == L4.Input,
+              L4.Output == L5.Input {
+        let o1 = l1(self)
+        let o2 = l2(o1)
+        let o3 = l3(o2)
+        let o4 = l4(o3)
+        return l5(o4)
     }
 
     /// Returns the output computed by applying a sequence of layers to the previous layer's output,
     /// except that the first layer's input is `self`.
     ///
     /// - Parameters:
-    ///   - context: The context that stores contextual information used for the application of
-    ///     layers.
     ///   - l1: The first layer.
     ///   - l2: The second layer.
     ///   - l3: The third layer.
@@ -212,20 +166,16 @@ public extension Differentiable {
     /// - Returns: The final layer's output after sequential application.
     @differentiable
     func sequenced<L1: Layer, L2: Layer, L3: Layer, L4: Layer, L5: Layer, L6: Layer>(
-        in context: Context, through l1: L1, _ l2: L2, _ l3: L3, _ l4: L4, _ l5: L5, _ l6: L6)
-        -> L6.Output
-            where L1.Input == Self,
-                  L1.Output == L2.Input,
-                  L2.Output == L3.Input,
-                  L3.Output == L4.Input,
-                  L4.Output == L5.Input,
-                  L5.Output == L6.Input {
-        let o1 = l1.applied(to: self, in: context)
-        let o2 = l2.applied(to: o1, in: context)
-        let o3 = l3.applied(to: o2, in: context)
-        let o4 = l4.applied(to: o3, in: context)
-        let o5 = l5.applied(to: o4, in: context)
-        return l6.applied(to: o5, in: context)
+        through l1: L1, _ l2: L2, _ l3: L3, _ l4: L4, _ l5: L5, _ l6: L6
+    ) -> L6.Output
+        where L1.Input == Self, L1.Output == L2.Input, L2.Output == L3.Input, L3.Output == L4.Input,
+              L4.Output == L5.Input, L5.Output == L6.Input {
+        let o1 = l1(self)
+        let o2 = l2(o1)
+        let o3 = l3(o2)
+        let o4 = l4(o3)
+        let o5 = l5(o4)
+        return l6(o5)
     }
 }
 
@@ -265,13 +215,10 @@ public struct Dense<Scalar: TensorFlowFloatingPoint>: Layer {
 
     /// Returns the output obtained from applying the layer to the given input.
     ///
-    /// - Parameters:
-    ///   - input: The input to the layer.
-    ///   - context: The contextual information for the layer application, e.g. the current learning
-    ///     phase.
+    /// - Parameter input: The input to the layer.
     /// - Returns: The output.
     @differentiable
-    public func applied(to input: Tensor<Scalar>, in _: Context) -> Tensor<Scalar> {
+    public func call(_ input: Tensor<Scalar>) -> Tensor<Scalar> {
         return activation(matmul(input, weight) + bias)
     }
 }
@@ -295,9 +242,9 @@ public extension Dense {
         activation: @escaping Activation = identity,
         generator: inout G
     ) {
-        self.init(weight: Tensor(glorotUniform: [Int32(inputSize), Int32(outputSize)],
+        self.init(weight: Tensor(glorotUniform: [inputSize, outputSize],
                                  generator: &generator),
-                  bias: Tensor(zeros: [Int32(outputSize)]),
+                  bias: Tensor(zeros: [outputSize]),
                   activation: activation)
     }
 
@@ -325,10 +272,128 @@ public extension Dense {
         seed: (Int64, Int64) = (Int64.random(in: Int64.min..<Int64.max),
                                 Int64.random(in: Int64.min..<Int64.max))
     ) {
-        self.init(weight: Tensor(glorotUniform: [Int32(inputSize), Int32(outputSize)],
+        self.init(weight: Tensor(glorotUniform: [inputSize, outputSize],
                                  seed: seed),
-                  bias: Tensor(zeros: [Int32(outputSize)]),
+                  bias: Tensor(zeros: [outputSize]),
                   activation: activation)
+    }
+}
+
+/// A 1-D convolution layer (e.g. temporal convolution over a time-series).
+///
+/// This layer creates a convolution filter that is convolved with the layer input to produce a
+/// tensor of outputs.
+@_fixed_layout
+public struct Conv1D<Scalar: TensorFlowFloatingPoint>: Layer {
+    /// The 3-D convolution kernel `[width, inputChannels, outputChannels]`.
+    public var filter: Tensor<Scalar>
+    /// The bias vector `[outputChannels]`.
+    public var bias: Tensor<Scalar>
+    /// An activation function.
+    public typealias Activation = @differentiable (Tensor<Scalar>) -> Tensor<Scalar>
+    /// The element-wise activation function.
+    @noDerivative public let activation: Activation
+    /// The stride of the sliding window for temporal dimension.
+    @noDerivative public let stride: Int
+    /// The padding algorithm for convolution.
+    @noDerivative public let padding: Padding
+
+    /// Creates a `Conv1D` layer with the specified filter, bias, activation function, stride, and
+    /// padding.
+    ///
+    /// - Parameters:
+    ///   - filter: The 3-D convolution kernel `[width, inputChannels, outputChannels]`.
+    ///   - bias: The bias vector `[outputChannels]`.
+    ///   - activation: The element-wise activation function.
+    ///   - stride: The stride of the sliding window for temporal dimension.
+    ///   - padding: The padding algorithm for convolution.
+    public init(
+        filter: Tensor<Scalar>,
+        bias: Tensor<Scalar>,
+        activation: @escaping Activation,
+        stride: Int,
+        padding: Padding
+    ) {
+        self.filter = filter
+        self.bias = bias
+        self.activation = activation
+        self.stride = stride
+        self.padding = padding
+    }
+
+    /// Returns the output obtained from applying the layer to the given input.
+    ///
+    /// - Parameter input: The input to the layer `[batchCount, width, inputChannels]`.
+    /// - Returns: The output `[batchCount, newWidth, outputChannels]`.
+    @differentiable
+    public func call(_ input: Tensor<Scalar>) -> Tensor<Scalar> {
+        let conv2D = input.expandingShape(at: 1).convolved2D(
+            withFilter: filter.expandingShape(at: 0), strides: (1, 1, stride, 1), padding: padding)
+        return activation(conv2D.squeezingShape(at: 1) + bias)
+    }
+}
+
+public extension Conv1D where Scalar.RawSignificand: FixedWidthInteger {
+    /// Creates a `Conv1D` layer with the specified filter shape, stride, padding, and
+    /// element-wise activation function. The filter tensor is initialized using Glorot uniform
+    /// initialization with the specified generator. The bias vector is initialized with zeros.
+    ///
+    /// - Parameters:
+    ///   - filterShape: The 3-D shape of the filter, representing
+    ///     `[width, inputChannels, outputChannels]`.
+    ///   - stride: The stride of the sliding window for temporal dimension.
+    ///   - padding: The padding algorithm for convolution.
+    ///   - activation: The element-wise activation function.
+    ///   - generator: The random number generator for initialization.
+    ///
+    /// - Note: Use `init(filterShape:stride:padding:activation:seed:)` for faster random
+    ///   initialization.
+    init<G: RandomNumberGenerator>(
+        filterShape: (Int, Int, Int),
+        stride: Int = 1,
+        padding: Padding = .valid,
+        activation: @escaping Activation = identity,
+        generator: inout G
+    ) {
+        let filterTensorShape = TensorShape([
+            filterShape.0, filterShape.1, filterShape.2])
+        self.init(
+            filter: Tensor(glorotUniform: filterTensorShape),
+            bias: Tensor(zeros: TensorShape([filterShape.2])),
+            activation: activation,
+            stride: stride,
+            padding: padding)
+    }
+}
+
+public extension Conv1D {
+    /// Creates a `Conv1D` layer with the specified filter shape, strides, padding, and
+    /// element-wise activation function. The filter tensor is initialized using Glorot uniform
+    /// initialization with the specified seed. The bias vector is initialized with zeros.
+    ///
+    /// - Parameters:
+    ///   - filterShape: The 3-D shape of the filter, representing
+    ///     `[width, inputChannels, outputChannels]`.
+    ///   - stride: The stride of the sliding window for temporal dimension.
+    ///   - padding: The padding algorithm for convolution.
+    ///   - activation: The element-wise activation function.
+    ///   - seed: The random seed for initialization. The default value is random.
+    init(
+        filterShape: (Int, Int, Int),
+        stride: Int = 1,
+        padding: Padding = .valid,
+        activation: @escaping Activation = identity,
+        seed: (Int64, Int64) = (Int64.random(in: Int64.min..<Int64.max),
+                                Int64.random(in: Int64.min..<Int64.max))
+    ) {
+        let filterTensorShape = TensorShape([
+            filterShape.0, filterShape.1, filterShape.2])
+        self.init(
+            filter: Tensor(glorotUniform: filterTensorShape, seed: seed),
+            bias: Tensor(zeros: TensorShape([filterShape.2])),
+            activation: activation,
+            stride: stride,
+            padding: padding)
     }
 }
 
@@ -346,9 +411,8 @@ public struct Conv2D<Scalar: TensorFlowFloatingPoint>: Layer {
     public typealias Activation = @differentiable (Tensor<Scalar>) -> Tensor<Scalar>
     /// The element-wise activation function.
     @noDerivative public let activation: Activation
-    /// The strides of the sliding window for each dimension of a 4-D input.
-    /// Strides in non-spatial dimensions must be `1`.
-    @noDerivative public let strides: (Int32, Int32)
+    /// The strides of the sliding window for spatial dimensions.
+    @noDerivative public let strides: (Int, Int)
     /// The padding algorithm for convolution.
     @noDerivative public let padding: Padding
 
@@ -356,11 +420,11 @@ public struct Conv2D<Scalar: TensorFlowFloatingPoint>: Layer {
     /// padding.
     ///
     /// - Parameters:
-    ///   - filter: The filter.
-    ///   - bias: The bias.
-    ///   - activation: The activation activation.
-    ///   - strides: The strides.
-    ///   - padding: The padding.
+    ///   - filter: The 4-D convolution kernel.
+    ///   - bias: The bias vector.
+    ///   - activation: The element-wise activation function.
+    ///   - strides: The strides of the sliding window for spatial dimensions.
+    ///   - padding: The padding algorithm for convolution.
     public init(
         filter: Tensor<Scalar>,
         bias: Tensor<Scalar>,
@@ -371,19 +435,16 @@ public struct Conv2D<Scalar: TensorFlowFloatingPoint>: Layer {
         self.filter = filter
         self.bias = bias
         self.activation = activation
-        (self.strides.0, self.strides.1) = (Int32(strides.0), Int32(strides.1))
+        self.strides = strides
         self.padding = padding
     }
 
     /// Returns the output obtained from applying the layer to the given input.
     ///
-    /// - Parameters:
-    ///   - input: The input to the layer.
-    ///   - context: The contextual information for the layer application, e.g. the current learning
-    ///     phase.
+    /// - Parameter input: The input to the layer.
     /// - Returns: The output.
     @differentiable
-    public func applied(to input: Tensor<Scalar>, in _: Context) -> Tensor<Scalar> {
+    public func call(_ input: Tensor<Scalar>) -> Tensor<Scalar> {
         return activation(input.convolved2D(withFilter: filter,
                                             strides: (1, strides.0, strides.1, 1),
                                             padding: padding) + bias)
@@ -396,10 +457,10 @@ public extension Conv2D {
     /// initialization with the specified generator. The bias vector is initialized with zeros.
     ///
     /// - Parameters:
-    ///   - filterShape: The shape of the filter, represented by a tuple of `4` integers.
-    ///   - strides: The strides.
-    ///   - padding: The padding.
-    ///   - activation: The activation function.
+    ///   - filterShape: The shape of the 4-D convolution kernel.
+    ///   - strides: The strides of the sliding window for spatial dimensions.
+    ///   - padding: The padding algorithm for convolution.
+    ///   - activation: The element-wise activation function.
     ///   - generator: The random number generator for initialization.
     ///
     /// - Note: Use `init(filterShape:strides:padding:activation:seed:)` for faster random
@@ -412,11 +473,10 @@ public extension Conv2D {
         generator: inout G
     ) {
         let filterTensorShape = TensorShape([
-            Int32(filterShape.0), Int32(filterShape.1),
-            Int32(filterShape.2), Int32(filterShape.3)])
+            filterShape.0, filterShape.1, filterShape.2, filterShape.3])
         self.init(
             filter: Tensor(glorotUniform: filterTensorShape, generator: &generator),
-            bias: Tensor(zeros: TensorShape([Int32(filterShape.3)])),
+            bias: Tensor(zeros: TensorShape([filterShape.3])),
             activation: activation,
             strides: strides,
             padding: padding)
@@ -429,14 +489,11 @@ public extension Conv2D {
     /// initialization with the specified seed. The bias vector is initialized with zeros.
     ///
     /// - Parameters:
-    ///   - filterShape: The shape of the filter, represented by a tuple of `4` integers.
-    ///   - strides: The strides.
-    ///   - padding: The padding.
-    ///   - activation: The activation function.
+    ///   - filterShape: The shape of the 4-D convolution kernel.
+    ///   - strides: The strides of the sliding window for spatial dimensions.
+    ///   - padding: The padding algorithm for convolution.
+    ///   - activation: The element-wise activation function.
     ///   - seed: The random seed for initialization. The default value is random.
-    ///
-    /// - Note: Use `init(filterShape:strides:padding:activation:seed:)` for faster random
-    ///   initialization.
     init(
         filterShape: (Int, Int, Int, Int),
         strides: (Int, Int) = (1, 1),
@@ -446,14 +503,138 @@ public extension Conv2D {
                                 Int64.random(in: Int64.min..<Int64.max))
     ) {
         let filterTensorShape = TensorShape([
-            Int32(filterShape.0), Int32(filterShape.1),
-            Int32(filterShape.2), Int32(filterShape.3)])
+            filterShape.0, filterShape.1, filterShape.2, filterShape.3])
         self.init(
-          filter: Tensor(glorotUniform: filterTensorShape, seed: seed),
-          bias: Tensor(zeros: TensorShape([Int32(filterShape.3)])),
-          activation: activation,
-          strides: (Int32(strides.0), Int32(strides.1)),
-          padding: padding)
+            filter: Tensor(glorotUniform: filterTensorShape, seed: seed),
+            bias: Tensor(zeros: TensorShape([filterShape.3])),
+            activation: activation,
+            strides: strides,
+            padding: padding)
+    }
+}
+
+/// A 2-D transposed convolution layer (e.g. spatial transposed convolution over images).
+///
+/// This layer creates a convolution filter that is transpose-convolved with the layer input
+/// to produce a tensor of outputs.
+@_fixed_layout
+public struct TransposedConv2D: Layer {
+    /// The 4-D convolution kernel.
+    public var filter: Tensor<Float>
+    /// The bias vector.
+    public var bias: Tensor<Float>
+    /// An activation function.
+    public typealias Activation = @differentiable (Tensor<Float>) -> Tensor<Float>
+    /// The element-wise activation function.
+    @noDerivative public let activation: Activation
+    /// The strides of the sliding window for spatial dimensions.
+    @noDerivative public let strides: (Int, Int)
+    /// The padding algorithm for convolution.
+    @noDerivative public let padding: Padding
+    @noDerivative public let paddingIndex: Int
+
+    /// Creates a `TransposedConv2D` layer with the specified filter, bias,
+    /// activation function, strides, and padding.
+    ///
+    /// - Parameters:
+    ///   - filter: The 4-D convolution kernel.
+    ///   - bias: The bias vector.
+    ///   - activation: The element-wise activation function.
+    ///   - strides: The strides of the sliding window for spatial dimensions.
+    ///   - padding: The padding algorithm for convolution.
+    public init(
+        filter: Tensor<Float>,
+        bias: Tensor<Float>,
+        activation: @escaping Activation,
+        strides: (Int, Int),
+        padding: Padding
+    ) {
+        self.filter = filter
+        self.bias = bias
+        self.activation = activation
+        self.strides = strides
+        self.padding = padding
+        self.paddingIndex = padding == .same ? 0 : 1
+    }
+
+    /// Returns the output obtained from applying the layer to the given input.
+    ///
+    /// - Parameter input: The input to the layer.
+    /// - Returns: The output.
+    @differentiable
+    public func call(_ input: Tensor<Float>) -> Tensor<Float> {
+        let batchSize = input.shape[0]
+        let w = (input.shape[1] - (1 * paddingIndex)) *
+          strides.0 + (filter.shape[0] * paddingIndex)
+        let h = (input.shape[2] - (1 * paddingIndex)) *
+          strides.1 + (filter.shape[1] * paddingIndex)
+        let c = filter.shape[2]
+        let newShape = Tensor<Int32>([Int32(batchSize), Int32(w), Int32(h), Int32(c)])
+        return activation(input.conv2DBackpropInput(shape: newShape, filter: filter,
+                                                    strides: (1, strides.0, strides.1, 1),
+                                                    padding: padding) + bias)
+    }
+}
+
+public extension TransposedConv2D {
+    /// Creates a `TransposedConv2D` layer with the specified filter shape, strides, padding, and
+    /// element-wise activation function. The filter tensor is initialized using Glorot uniform
+    /// initialization with the specified generator. The bias vector is initialized with zeros.
+    ///
+    /// - Parameters:
+    ///   - filterShape: The shape of the 4-D convolution kernel.
+    ///   - strides: The strides of the sliding window for spatial dimensions.
+    ///   - padding: The padding algorithm for convolution.
+    ///   - activation: The element-wise activation function.
+    ///   - generator: The random number generator for initialization.
+    ///
+    /// - Note: Use `init(filterShape:strides:padding:activation:seed:)` for faster random
+    ///   initialization.
+    init<G: RandomNumberGenerator>(
+        filterShape: (Int, Int, Int, Int),
+        strides: (Int, Int) = (1, 1),
+        padding: Padding = .valid,
+        activation: @escaping Activation = identity,
+        generator: inout G
+    ) {
+        let filterTensorShape = TensorShape([
+            filterShape.0, filterShape.1, filterShape.2, filterShape.3])
+        self.init(
+            filter: Tensor(glorotUniform: filterTensorShape, generator: &generator),
+            bias: Tensor(zeros: TensorShape([filterShape.3])),
+            activation: activation,
+            strides: strides,
+            padding: padding)
+    }
+}
+
+public extension TransposedConv2D {
+    /// Creates a `TransposedConv2D` layer with the specified filter shape, strides, padding, and
+    /// element-wise activation function. The filter tensor is initialized using Glorot uniform
+    /// initialization with the specified seed. The bias vector is initialized with zeros.
+    ///
+    /// - Parameters:
+    ///   - filterShape: The shape of the 4-D convolution kernel.
+    ///   - strides: The strides of the sliding window for spatial dimensions.
+    ///   - padding: The padding algorithm for convolution.
+    ///   - activation: The element-wise activation function.
+    ///   - seed: The random seed for initialization. The default value is random.
+    init(
+        filterShape: (Int, Int, Int, Int),
+        strides: (Int, Int) = (1, 1),
+        padding: Padding = .valid,
+        activation: @escaping Activation = identity,
+        seed: (Int64, Int64) = (Int64.random(in: Int64.min..<Int64.max),
+                                Int64.random(in: Int64.min..<Int64.max))
+    ) {
+        let filterTensorShape = TensorShape([
+            filterShape.0, filterShape.1, filterShape.2, filterShape.3])
+        self.init(
+            filter: Tensor(glorotUniform: filterTensorShape, seed: seed),
+            bias: Tensor(zeros: TensorShape([filterShape.3])),
+            activation: activation,
+            strides: strides,
+            padding: padding)
     }
 }
 
@@ -467,8 +648,8 @@ public extension Conv2D {
 /// Covariate Shift](https://arxiv.org/abs/1502.03167).
 @_fixed_layout
 public struct BatchNorm<Scalar: TensorFlowFloatingPoint>: Layer {
-    /// The batch dimension.
-    @noDerivative public let axis: Int32
+    /// The feature dimension.
+    @noDerivative public let axis: Int
     /// The momentum for the running mean and running variance.
     @noDerivative public let momentum: Tensor<Scalar>
     /// The offset value, also known as beta.
@@ -485,7 +666,7 @@ public struct BatchNorm<Scalar: TensorFlowFloatingPoint>: Layer {
     /// Creates a batch normalization layer.
     ///
     /// - Parameters:
-    ///   - axis: The axis that should be normalized (typically the features axis).
+    ///   - axis: The axis that should not be normalized (typically the feature axis).
     ///   - momentum: The momentum for the moving average.
     ///   - offset: The offset to be added to the normalized tensor.
     ///   - scale: The scale to multiply the normalized tensor by.
@@ -501,7 +682,7 @@ public struct BatchNorm<Scalar: TensorFlowFloatingPoint>: Layer {
         runningMean: Tensor<Scalar>,
         runningVariance: Tensor<Scalar>
     ) {
-        self.axis = Int32(axis)
+        self.axis = axis
         self.momentum = momentum
         self.offset = offset
         self.scale = scale
@@ -513,8 +694,10 @@ public struct BatchNorm<Scalar: TensorFlowFloatingPoint>: Layer {
     @differentiable
     private func applyingTraining(to input: Tensor<Scalar>) -> Tensor<Scalar> {
         let positiveAxis = (input.rank + axis) % input.rank
-        let mean = input.mean(alongAxes: [0, positiveAxis])
-        let variance = input.variance(alongAxes: [0, positiveAxis])
+        var normalizedAxes = Array(0..<input.rank)
+        normalizedAxes.remove(at: positiveAxis)
+        let mean = input.mean(alongAxes: normalizedAxes)
+        let variance = input.variance(alongAxes: normalizedAxes)
         runningMean.value += (mean - runningMean.value) * (1 - momentum)
         runningVariance.value += (
             variance - runningVariance.value) * (1 - momentum)
@@ -530,14 +713,11 @@ public struct BatchNorm<Scalar: TensorFlowFloatingPoint>: Layer {
 
     /// Returns the output obtained from applying the layer to the given input.
     ///
-    /// - Parameters:
-    ///   - input: The input to the layer.
-    ///   - context: The contextual information for the layer application, e.g. the current learning
-    ///     phase.
+    /// - Parameter input: The input to the layer.
     /// - Returns: The output.
-    @differentiable(vjp: _vjpApplied(to:in:))
-    public func applied(to input: Tensor<Scalar>, in context: Context) -> Tensor<Scalar> {
-        switch context.learningPhase {
+    @differentiable(vjp: _vjpApplied(to:))
+    public func call(_ input: Tensor<Scalar>) -> Tensor<Scalar> {
+        switch Context.local.learningPhase {
         case .training:
             return applyingTraining(to: input)
         case .inference:
@@ -546,10 +726,10 @@ public struct BatchNorm<Scalar: TensorFlowFloatingPoint>: Layer {
     }
 
     @usableFromInline
-    func _vjpApplied(to input: Tensor<Scalar>, in context: Context) ->
+    func _vjpApplied(to input: Tensor<Scalar>) ->
         (Tensor<Scalar>, (Tensor<Scalar>) ->
             (BatchNorm<Scalar>.CotangentVector, Tensor<Scalar>)) {
-        switch context.learningPhase {
+        switch Context.local.learningPhase {
         case .training:
             return valueWithPullback(at: input) {
                 $0.applyingTraining(to: $1)
@@ -572,13 +752,51 @@ public struct BatchNorm<Scalar: TensorFlowFloatingPoint>: Layer {
                 axis: Int = -1,
                 momentum: Tensor<Scalar> = Tensor(0.99),
                 epsilon: Tensor<Scalar> = Tensor(0.001)) {
-        self.axis = Int32(axis)
+        self.axis = axis
         self.momentum = momentum
-        self.scale = Tensor<Scalar>(ones: [Int32(featureCount)])
-        self.offset = Tensor<Scalar>(zeros: [Int32(featureCount)])
+        self.scale = Tensor<Scalar>(ones: [featureCount])
+        self.offset = Tensor<Scalar>(zeros: [featureCount])
         self.epsilon = epsilon
         self.runningMean = Parameter(Tensor(0))
         self.runningVariance = Parameter(Tensor(1))
+    }
+}
+
+/// A max pooling layer for temporal data.
+@_fixed_layout
+public struct MaxPool1D<Scalar: TensorFlowFloatingPoint>: Layer {
+    /// The size of the sliding reduction window for pooling.
+    @noDerivative let poolSize: Int
+    /// The stride of the sliding window for temporal dimension.
+    @noDerivative let stride: Int
+    /// The padding algorithm for pooling.
+    @noDerivative let padding: Padding
+
+    /// Creates a max pooling layer.
+    ///
+    /// - Parameters:
+    ///   - poolSize: The size of the sliding reduction window for pooling.
+    ///   - stride: The stride of the sliding window for temporal dimension.
+    ///   - padding: The padding algorithm for pooling.
+    public init(
+        poolSize: Int,
+        stride: Int,
+        padding: Padding
+    ) {
+        self.poolSize = poolSize
+        self.stride = stride
+        self.padding = padding
+    }
+
+    /// Returns the output obtained from applying the layer to the given input.
+    ///
+    /// - Parameter input: The input to the layer.
+    /// - Returns: The output.
+    @differentiable
+    public func call(_ input: Tensor<Scalar>) -> Tensor<Scalar> {
+        return input.expandingShape(at: 1).maxPooled(
+            kernelSize: (1, 1, poolSize, 1), strides: (1, 1, stride, 1), padding: padding
+        ).squeezingShape(at: 1)
     }
 }
 
@@ -586,10 +804,10 @@ public struct BatchNorm<Scalar: TensorFlowFloatingPoint>: Layer {
 @_fixed_layout
 public struct MaxPool2D<Scalar: TensorFlowFloatingPoint>: Layer {
     /// The size of the sliding reduction window for pooling.
-    @noDerivative let poolSize: (Int32, Int32, Int32, Int32)
+    @noDerivative let poolSize: (Int, Int, Int, Int)
     /// The strides of the sliding window for each dimension of a 4-D input.
     /// Strides in non-spatial dimensions must be `1`.
-    @noDerivative let strides: (Int32, Int32, Int32, Int32)
+    @noDerivative let strides: (Int, Int, Int, Int)
     /// The padding algorithm for pooling.
     @noDerivative let padding: Padding
 
@@ -599,10 +817,8 @@ public struct MaxPool2D<Scalar: TensorFlowFloatingPoint>: Layer {
         strides: (Int, Int, Int, Int),
         padding: Padding
     ) {
-        (self.poolSize.0, self.poolSize.1, self.poolSize.2, self.poolSize.3)
-            = (Int32(poolSize.0), Int32(poolSize.1), Int32(poolSize.2), Int32(poolSize.3))
-        (self.strides.0, self.strides.1, self.strides.2, self.strides.3)
-            = (Int32(strides.0), Int32(strides.1), Int32(strides.2), Int32(strides.3))
+        self.poolSize = poolSize
+        self.strides = strides
         self.padding = padding
     }
 
@@ -613,22 +829,57 @@ public struct MaxPool2D<Scalar: TensorFlowFloatingPoint>: Layer {
     ///   - strides: The strides.
     ///   - padding: The padding.
     public init(poolSize: (Int, Int), strides: (Int, Int), padding: Padding = .valid) {
-        self.poolSize = (1, Int32(poolSize.0), Int32(poolSize.1), 1)
-        self.strides = (1, Int32(strides.0), Int32(strides.1), 1)
+        self.poolSize = (1, poolSize.0, poolSize.1, 1)
+        self.strides = (1, strides.0, strides.1, 1)
         self.padding = padding
     }
 
     /// Returns the output obtained from applying the layer to the given input.
     ///
-    /// - Parameters:
-    ///   - input: The input to the layer.
-    ///   - context: The contextual information for the layer application, e.g. the current learning
-    ///     phase.
+    /// - Parameter input: The input to the layer.
     /// - Returns: The output.
     @differentiable
-    public func applied(to input: Tensor<Scalar>, in _: Context) -> Tensor<Scalar> {
+    public func call(_ input: Tensor<Scalar>) -> Tensor<Scalar> {
         return input.maxPooled(
-          kernelSize: poolSize, strides: strides, padding: padding)
+            kernelSize: poolSize, strides: strides, padding: padding)
+    }
+}
+
+/// An average pooling layer for temporal data.
+@_fixed_layout
+public struct AvgPool1D<Scalar: TensorFlowFloatingPoint>: Layer {
+    /// The size of the sliding reduction window for pooling.
+    @noDerivative let poolSize: Int
+    /// The stride of the sliding window for temporal dimension.
+    @noDerivative let stride: Int
+    /// The padding algorithm for pooling.
+    @noDerivative let padding: Padding
+
+    /// Creates an average pooling layer.
+    ///
+    /// - Parameters:
+    ///   - poolSize: The size of the sliding reduction window for pooling.
+    ///   - stride: The stride of the sliding window for temporal dimension.
+    ///   - padding: The padding algorithm for pooling.
+    public init(
+        poolSize: Int,
+        stride: Int,
+        padding: Padding
+    ) {
+        self.poolSize = poolSize
+        self.stride = stride
+        self.padding = padding
+    }
+
+    /// Returns the output obtained from applying the layer to the given input.
+    ///
+    /// - Parameter input: The input to the layer.
+    /// - Returns: The output.
+    @differentiable
+    public func call(_ input: Tensor<Scalar>) -> Tensor<Scalar> {
+        return input.expandingShape(at: 1).averagePooled(
+            kernelSize: (1, 1, poolSize, 1), strides: (1, 1, stride, 1), padding: padding
+        ).squeezingShape(at: 1)
     }
 }
 
@@ -636,10 +887,10 @@ public struct MaxPool2D<Scalar: TensorFlowFloatingPoint>: Layer {
 @_fixed_layout
 public struct AvgPool2D<Scalar: TensorFlowFloatingPoint>: Layer {
     /// The size of the sliding reduction window for pooling.
-    @noDerivative let poolSize: (Int32, Int32, Int32, Int32)
+    @noDerivative let poolSize: (Int, Int, Int, Int)
     /// The strides of the sliding window for each dimension of a 4-D input.
     /// Strides in non-spatial dimensions must be `1`.
-    @noDerivative let strides: (Int32, Int32, Int32, Int32)
+    @noDerivative let strides: (Int, Int, Int, Int)
     /// The padding algorithm for pooling.
     @noDerivative let padding: Padding
 
@@ -649,10 +900,8 @@ public struct AvgPool2D<Scalar: TensorFlowFloatingPoint>: Layer {
         strides: (Int, Int, Int, Int),
         padding: Padding
     ) {
-        (self.poolSize.0, self.poolSize.1, self.poolSize.2, self.poolSize.3)
-            = (Int32(poolSize.0), Int32(poolSize.1), Int32(poolSize.2), Int32(poolSize.3))
-        (self.strides.0, self.strides.1, self.strides.2, self.strides.3)
-            = (Int32(strides.0), Int32(strides.1), Int32(strides.2), Int32(strides.3))
+        self.poolSize = poolSize
+        self.strides = strides
         self.padding = padding
     }
 
@@ -663,21 +912,67 @@ public struct AvgPool2D<Scalar: TensorFlowFloatingPoint>: Layer {
     ///   - strides: The strides.
     ///   - padding: The padding.
     public init(poolSize: (Int, Int), strides: (Int, Int), padding: Padding = .valid) {
-        self.poolSize = (1, Int32(poolSize.0), Int32(poolSize.1), 1)
-        self.strides = (1, Int32(strides.0), Int32(strides.1), 1)
+        self.poolSize = (1, poolSize.0, poolSize.1, 1)
+        self.strides = (1, strides.0, strides.1, 1)
         self.padding = padding
     }
 
     /// Returns the output obtained from applying the layer to the given input.
     ///
-    /// - Parameters:
-    ///   - input: The input to the layer.
-    ///   - context: The contextual information for the layer application, e.g. the current learning
-    ///     phase.
+    /// - Parameter input: The input to the layer.
     /// - Returns: The output.
     @differentiable
-    public func applied(to input: Tensor<Scalar>, in _: Context) -> Tensor<Scalar> {
+    public func call(_ input: Tensor<Scalar>) -> Tensor<Scalar> {
         return input.averagePooled(kernelSize: poolSize, strides: strides, padding: padding)
+    }
+}
+
+
+/// A global average pooling layer for temporal data.
+@_fixed_layout
+public struct GlobalAvgPool1D<Scalar: TensorFlowFloatingPoint>: Layer {
+    /// Creates a global average pooling layer.
+    public init() {}
+
+    /// Returns the output obtained from applying the layer to the given input.
+    ///
+    /// - Parameter input: The input to the layer.
+    /// - Returns: The output.
+    @differentiable
+    public func call(_ input: Tensor<Scalar>) -> Tensor<Scalar> {
+        return input.mean(squeezingAxes: 1)
+    }
+}
+
+/// A global average pooling layer for spatial data.
+@_fixed_layout
+public struct GlobalAvgPool2D<Scalar: TensorFlowFloatingPoint>: Layer {
+    /// Creates a global average pooling layer.
+    public init() {}
+
+    /// Returns the output obtained from applying the layer to the given input.
+    ///
+    /// - Parameter input: The input to the layer.
+    /// - Returns: The output.
+    @differentiable
+    public func call(_ input: Tensor<Scalar>) -> Tensor<Scalar> {
+        return input.mean(squeezingAxes: [1, 2])
+    }
+}
+
+/// A global average pooling layer for spatial and spatio-temporal data.
+@_fixed_layout
+public struct GlobalAvgPool3D<Scalar: TensorFlowFloatingPoint>: Layer {
+    /// Creates a global average pooling layer.
+    public init() {}
+
+    /// Returns the output obtained from applying the layer to the given input.
+    ///
+    /// - Parameter input: The input to the layer.
+    /// - Returns: The output.
+    @differentiable
+    public func call(_ input: Tensor<Scalar>) -> Tensor<Scalar> {
+        return input.mean(squeezingAxes: [1, 2, 3])
     }
 }
 
@@ -691,7 +986,7 @@ public struct LayerNorm<Scalar: TensorFlowFloatingPoint>: Layer {
     /// The scale value, also known as gamma.
     public var scale: Tensor<Scalar>
     /// The axis.
-    @noDerivative public let axis: Int32
+    @noDerivative public let axis: Int
     /// The variance epsilon value.
     @noDerivative public let epsilon: Tensor<Scalar>
 
@@ -704,7 +999,7 @@ public struct LayerNorm<Scalar: TensorFlowFloatingPoint>: Layer {
     ) {
         self.offset = offset
         self.scale = scale
-        self.axis = Int32(axis)
+        self.axis = axis
         self.epsilon = epsilon
     }
 
@@ -718,8 +1013,8 @@ public struct LayerNorm<Scalar: TensorFlowFloatingPoint>: Layer {
                 axis: Int,
                 epsilon: Tensor<Scalar> = Tensor(0.001)) {
         self.init(
-            offset: Tensor(zeros: [Int32(featureCount)]),
-            scale: Tensor(ones: [Int32(featureCount)]),
+            offset: Tensor(zeros: [featureCount]),
+            scale: Tensor(ones: [featureCount]),
             axis: axis,
             epsilon: epsilon
         )
@@ -727,13 +1022,10 @@ public struct LayerNorm<Scalar: TensorFlowFloatingPoint>: Layer {
 
     /// Returns the output obtained from applying the layer to the given input.
     ///
-    /// - Parameters:
-    ///   - input: The input to the layer.
-    ///   - context: The contextual information for the layer application, e.g. the current learning
-    ///     phase.
+    /// - Parameter input: The input to the layer.
     /// - Returns: The output.
     @differentiable
-    public func applied(to input: Tensor<Scalar>, in _: Context) -> Tensor<Scalar> {
+    public func call(_ input: Tensor<Scalar>) -> Tensor<Scalar> {
         let mean = input.mean(alongAxes: axis)
         let variance = input.variance(alongAxes: axis)
         let inv = rsqrt(variance + epsilon) * scale
@@ -779,14 +1071,11 @@ public struct Dropout<Scalar: TensorFlowFloatingPoint>: Layer {
 
     /// Returns the output obtained from applying the layer to the given input.
     ///
-    /// - Parameters:
-    ///   - input: The input to the layer.
-    ///   - context: The contextual information for the layer application, e.g. the current learning
-    ///     phase.
+    /// - Parameter input: The input to the layer.
     /// - Returns: The output.
-    @differentiable(vjp: _vjpApplied(to:in:))
-    public func applied(to input: Tensor<Scalar>, in context: Context) -> Tensor<Scalar> {
-        switch context.learningPhase {
+    @differentiable(vjp: _vjpApplied(to:))
+    public func call(_ input: Tensor<Scalar>) -> Tensor<Scalar> {
+        switch Context.local.learningPhase {
         case .training:
             return applyingTraining(to: input)
         case .inference:
@@ -795,10 +1084,10 @@ public struct Dropout<Scalar: TensorFlowFloatingPoint>: Layer {
     }
 
     @usableFromInline
-    func _vjpApplied(to input: Tensor<Scalar>, in context: Context) ->
+    func _vjpApplied(to input: Tensor<Scalar>) ->
         (Tensor<Scalar>, (Tensor<Scalar>) ->
             (Dropout<Scalar>.CotangentVector, Tensor<Scalar>)) {
-        switch context.learningPhase {
+        switch Context.local.learningPhase {
         case .training:
             return valueWithPullback(at: input) {
                 $0.applyingTraining(to: $1)
@@ -811,27 +1100,50 @@ public struct Dropout<Scalar: TensorFlowFloatingPoint>: Layer {
     }
 }
 
-/// An upsampling layer for 2-D inputs.
+/// An upsampling layer for 1-D inputs.
 @_fixed_layout
-public struct UpSampling2D<Scalar: TensorFlowFloatingPoint>: Layer {
-    @noDerivative public let size: Int32
+public struct UpSampling1D<Scalar: TensorFlowFloatingPoint>: Layer {
+    @noDerivative public let size: Int
 
     /// Creates an upsampling layer.
     ///
-    /// - Parameter size: The upsampling factor for rows and columns.
-    public init(size: Int32) {
+    /// - Parameter size: The upsampling factor for timesteps.
+    public init(size: Int) {
        self.size = size
     }
 
     /// Returns the output obtained from applying the layer to the given input.
     ///
-    /// - Parameters:
-    ///   - input: The input to the layer.
-    ///   - context: The contextual information for the layer application, e.g. the current learning
-    ///     phase.
+    /// - Parameter input: The input to the layer.
     /// - Returns: The output.
     @differentiable
-    public func applied(to input: Tensor<Scalar>, in _: Context) -> Tensor<Scalar> {
+    public func call(_ input: Tensor<Scalar>) -> Tensor<Scalar> {
+        let shape = input.shape
+        let (batchSize, timesteps, channels) = (shape[0], shape[1], shape[2])
+        let scaleOnes = Tensor<Scalar>(ones: [1, 1, size, 1])
+        let upSampling = input.reshaped(to: [batchSize, timesteps, 1, channels]) * scaleOnes
+        return upSampling.reshaped(to: [batchSize, timesteps * size, channels])
+    }
+}
+
+/// An upsampling layer for 2-D inputs.
+@_fixed_layout
+public struct UpSampling2D<Scalar: TensorFlowFloatingPoint>: Layer {
+    @noDerivative public let size: Int
+
+    /// Creates an upsampling layer.
+    ///
+    /// - Parameter size: The upsampling factor for rows and columns.
+    public init(size: Int) {
+       self.size = size
+    }
+
+    /// Returns the output obtained from applying the layer to the given input.
+    ///
+    /// - Parameter input: The input to the layer.
+    /// - Returns: The output.
+    @differentiable
+    public func call(_ input: Tensor<Scalar>) -> Tensor<Scalar> {
         let shape = input.shape
         let (batchSize, height, width, channels) = (shape[0], shape[1], shape[2], shape[3])
         let scaleOnes = Tensor<Scalar>(ones: [1, 1, size, 1, size, 1])
@@ -850,13 +1162,10 @@ public struct Flatten<Scalar: TensorFlowFloatingPoint>: Layer {
 
     /// Returns the output obtained from applying the layer to the given input.
     ///
-    /// - Parameters:
-    ///   - input: The input to the layer.
-    ///   - context: The contextual information for the layer application, e.g. the current learning
-    ///     phase.
+    /// - Parameter input: The input to the layer.
     /// - Returns: The output.
     @differentiable
-    public func applied(to input: Tensor<Scalar>, in _: Context) -> Tensor<Scalar> {
+    public func call(_ input: Tensor<Scalar>) -> Tensor<Scalar> {
         let batchSize = input.shape[0]
         let remaining = input.shape[1..<input.rank].contiguousSize
         return input.reshaped(to: [batchSize, remaining])
@@ -870,7 +1179,8 @@ public struct Reshape<Scalar: TensorFlowFloatingPoint>: Layer {
     @noDerivative public let shape: Tensor<Int32>
 
     // TF-331 workaround:
-    private var _nontrivial = Tensor<Float>(0)
+    @usableFromInline
+    internal var _nontrivial = Tensor<Float>(0)
 
     /// Creates a reshape layer.
     ///
@@ -883,18 +1193,276 @@ public struct Reshape<Scalar: TensorFlowFloatingPoint>: Layer {
     ///
     /// - Parameter shape: The target shape.
     public init(_ shape: TensorShape) {
-        self.init(shape: Tensor(shape.dimensions))
+      self.init(shape: Tensor(shape.dimensions.map(Int32.init)))
     }
 
     /// Returns the output obtained from applying the layer to the given input.
     ///
-    /// - Parameters:
-    ///   - input: The input to the layer.
-    ///   - context: The contextual information for the layer application, e.g. the current learning
-    ///     phase.
+    /// - Parameter input: The input to the layer.
     /// - Returns: The output.
     @differentiable
-    public func applied(to input: Tensor<Scalar>, in _: Context) -> Tensor<Scalar> {
+    public func call(_ input: Tensor<Scalar>) -> Tensor<Scalar> {
         return input.reshaped(toShape: shape)
     }
 }
+
+/// An input to a recurrent neural network.
+public struct RNNCellInput<Input: Differentiable, State: Differentiable>: Differentiable {
+    /// The input at the current time step.
+    public var input: Input
+    /// The previous state.
+    public var state: State
+
+    @differentiable
+    public init(input: Input, state: State) {
+        self.input = input
+        self.state = state
+    }
+}
+
+/// An output to a recurrent neural network.
+public struct RNNCellOutput<Output: Differentiable, State: Differentiable>: Differentiable {
+    /// The output at the current time step.
+    public var output: Output
+    /// The current state.
+    public var state: State
+
+    @differentiable
+    public init(output: Output, state: State) {
+        self.output = output
+        self.state = state
+    }
+}
+
+/// A recurrent neural network cell.
+public protocol RNNCell: Layer where Input == RNNCellInput<TimeStepInput, State>,
+                                     Output == RNNCellOutput<TimeStepOutput, State> {
+    /// The input at a time step.
+    associatedtype TimeStepInput: Differentiable
+    /// The output at a time step.
+    associatedtype TimeStepOutput: Differentiable
+    /// The state that may be preserved across time steps.
+    associatedtype State: Differentiable
+    /// The zero state.
+    var zeroState: State { get }
+}
+
+public extension RNNCell {
+    /// Returns the new state obtained from applying the RNN cell to the input at the current time
+    /// step and the previous state.
+    ///
+    /// - Parameters:
+    ///   - timeStepInput: The input at the current time step.
+    ///   - previousState: The previous state of the RNN cell.
+    /// - Returns: The output.
+    @differentiable
+    func call(input: TimeStepInput, state: State) -> RNNCellOutput<TimeStepOutput, State> {
+        return self(RNNCellInput(input: input, state: state))
+    }
+}
+
+/// A simple RNN cell.
+public struct SimpleRNNCell<Scalar: TensorFlowFloatingPoint>: RNNCell, VectorNumeric {
+    public var weight: Tensor<Scalar>
+    public var bias: Tensor<Scalar>
+
+    @noDerivative public var stateShape: TensorShape {
+        return TensorShape([1, weight.shape[1]])
+    }
+
+    public var zeroState: Tensor<Scalar> {
+        return Tensor(zeros: stateShape)
+    }
+
+    public typealias State = Tensor<Scalar>
+    public typealias TimeStepInput = Tensor<Scalar>
+    public typealias TimeStepOutput = State
+    public typealias Input = RNNCellInput<TimeStepInput, State>
+    public typealias Output = RNNCellOutput<TimeStepOutput, State>
+
+    /// Creates a `SimpleRNNCell` with the specified input size and hidden state size.
+    ///
+    /// - Parameters:
+    ///   - inputSize: The number of features in 2-D input tensors.
+    ///   - hiddenSize: The number of features in 2-D hidden states.
+    ///   - seed: The random seed for initialization. The default value is random.
+    public init(inputSize: Int, hiddenSize: Int,
+                seed: (Int64, Int64) = (Int64.random(in: Int64.min..<Int64.max),
+                                        Int64.random(in: Int64.min..<Int64.max))) {
+        let concatenatedInputSize = inputSize + hiddenSize
+        self.weight = Tensor(glorotUniform: [concatenatedInputSize, hiddenSize],
+                             seed: seed)
+        self.bias = Tensor(zeros: [hiddenSize])
+    }
+
+    /// Returns the output obtained from applying the layer to the given input.
+    ///
+    /// - Parameter input: The input to the layer.
+    /// - Returns: The hidden state.
+    @differentiable
+    public func call(_ input: Input) -> Output {
+        let concatenatedInput = input.input.concatenated(with: input.state, alongAxis: 1)
+        let newState = tanh(matmul(concatenatedInput, weight) + bias)
+        return Output(output: newState, state: newState)
+    }
+}
+
+/// An LSTM cell.
+public struct LSTMCell<Scalar: TensorFlowFloatingPoint>: RNNCell, VectorNumeric {
+    public var inputWeight, updateWeight, forgetWeight, outputWeight: Tensor<Scalar>
+    public var inputBias, updateBias, forgetBias, outputBias: Tensor<Scalar>
+
+    @noDerivative public var stateShape: TensorShape {
+        return TensorShape([1, inputWeight.shape[1]])
+    }
+
+    public var zeroState: State {
+        return State(cell: Tensor(zeros: stateShape), hidden: Tensor(zeros: stateShape))
+    }
+
+    public typealias TimeStepInput = Tensor<Scalar>
+    public typealias TimeStepOutput = State
+    public typealias Input = RNNCellInput<TimeStepInput, State>
+    public typealias Output = RNNCellOutput<TimeStepOutput, State>
+
+    /// Creates a `LSTMCell` with the specified input size and hidden state size.
+    ///
+    /// - Parameters:
+    ///   - inputSize: The number of features in 2-D input tensors.
+    ///   - hiddenSize: The number of features in 2-D hidden states.
+    public init(inputSize: Int, hiddenSize: Int,
+                seed: (Int64, Int64) = (Int64.random(in: Int64.min..<Int64.max),
+                                        Int64.random(in: Int64.min..<Int64.max))) {
+        let concatenatedInputSize = inputSize + hiddenSize
+        let gateWeightShape = TensorShape([concatenatedInputSize, hiddenSize])
+        let gateBiasShape = TensorShape([hiddenSize])
+        self.inputWeight = Tensor(glorotUniform: gateWeightShape, seed: seed)
+        self.inputBias = Tensor(zeros: gateBiasShape)
+        self.updateWeight = Tensor(glorotUniform: gateWeightShape, seed: seed)
+        self.updateBias = Tensor(zeros: gateBiasShape)
+        self.forgetWeight = Tensor(glorotUniform: gateWeightShape, seed: seed)
+        self.forgetBias = Tensor(ones: gateBiasShape)
+        self.outputWeight = Tensor(glorotUniform: gateWeightShape, seed: seed)
+        self.outputBias = Tensor(zeros: gateBiasShape)
+    }
+
+    public struct State: Differentiable {
+        public var cell: Tensor<Scalar>
+        public var hidden: Tensor<Scalar>
+
+        @differentiable
+        public init(cell: Tensor<Scalar>, hidden: Tensor<Scalar>) {
+            self.cell = cell
+            self.hidden = hidden
+        }
+    }
+
+    /// Returns the output obtained from applying the layer to the given input.
+    ///
+    /// - Parameter input: The input to the layer.
+    /// - Returns: The hidden state.
+    @differentiable
+    public func call(_ input: Input) -> Output {
+        let gateInput = input.input.concatenated(with: input.state.hidden, alongAxis: 1)
+
+        let inputGate = sigmoid(matmul(gateInput, inputWeight) + inputBias)
+        let updateGate = tanh(matmul(gateInput, updateWeight) + updateBias)
+        let forgetGate = sigmoid(matmul(gateInput, forgetWeight) + forgetBias)
+        let outputGate = sigmoid(matmul(gateInput, outputWeight) + outputBias)
+
+        let newCellState = input.state.cell * forgetGate + inputGate * updateGate
+        let newHiddenState = tanh(newCellState) * outputGate
+
+        let newState = State(cell: newCellState, hidden: newHiddenState)
+
+        return Output(output: newState, state: newState)
+    }
+}
+
+public struct RNN<Cell: RNNCell>: Layer {
+    public typealias Input = [Cell.TimeStepInput]
+    public typealias Output = [Cell.TimeStepOutput]
+
+    public var cell: Cell
+    
+    public init(_ cell: @autoclosure () -> Cell) {
+        self.cell = cell()
+    }
+
+    @differentiable(wrt: (self, input), vjp: _vjpCall(_:initialState:))
+    public func call(_ input: [Cell.TimeStepInput],
+                     initialState: Cell.State) -> [Cell.TimeStepOutput] {
+        var currentHiddenState = initialState
+        var timeStepOutputs: [Cell.TimeStepOutput] = []
+        for timestep in input {
+            let output = cell(input: timestep, state: currentHiddenState)
+            currentHiddenState = output.state
+            timeStepOutputs.append(output.output)
+        }
+        return timeStepOutputs
+    }
+
+    @usableFromInline
+    internal func _vjpCall(
+        _ inputs: [Cell.TimeStepInput], initialState: Cell.State
+    ) -> ([Cell.TimeStepOutput],
+          (Array<Cell.TimeStepOutput>.CotangentVector)
+              -> (CotangentVector, Array<Cell.TimeStepInput>.CotangentVector)) {
+        let timeStepCount = inputs.count
+        var currentHiddenState = cell.zeroState
+        var timeStepOutputs: [Cell.TimeStepOutput] = []
+        timeStepOutputs.reserveCapacity(timeStepCount)
+        var backpropagators: [Cell.Backpropagator] = []
+        backpropagators.reserveCapacity(timeStepCount)
+        for timestep in inputs {
+            let (output, backpropagator) =
+                cell.appliedForBackpropagation(to: .init(input: timestep,
+                                                         state: currentHiddenState))
+            currentHiddenState = output.state
+            timeStepOutputs.append(output.output)
+            backpropagators.append(backpropagator)
+        }
+        return (timeStepOutputs, { 𝛁outputs in
+            precondition(𝛁outputs.base.count == timeStepCount,
+                         "The number of output gradients must equal the number of time steps")
+            var 𝛁cell = Cell.CotangentVector.zero
+            var 𝛁state = Cell.State.CotangentVector.zero
+            var reversed𝛁inputs: [Cell.TimeStepInput.CotangentVector] = []
+            reversed𝛁inputs.reserveCapacity(timeStepCount)
+            for (𝛁output, backpropagator) in zip(𝛁outputs.base, backpropagators).reversed() {
+                let (new𝛁cell, 𝛁input) = backpropagator(.init(output: 𝛁output, state: 𝛁state))
+                𝛁cell = new𝛁cell
+                𝛁state = 𝛁input.state
+                reversed𝛁inputs.append(𝛁input.input)
+            }
+            return (.init(cell: 𝛁cell), .init(Array(reversed𝛁inputs.reversed())))
+        })
+    }
+
+    @differentiable(wrt: (self, inputs))
+    public func call(_ inputs: [Cell.TimeStepInput]) -> [Cell.TimeStepOutput] {
+        return self(inputs, initialState: cell.zeroState.withoutDerivative())
+    }
+
+    /* TODO: Uncomment once control flow and differentiation through force unwrapping is supported.
+    @differentiable(wrt: (self, inputs))
+    public func lastOutput(from inputs: [Cell.TimeStepInput],
+                           initialState: Cell.State) -> Cell.TimeStepOutput {
+        precondition(!inputs.isEmpty, "inputs cannot be empty")
+        return self(inputs, initialState: initialState).last!
+    }
+
+    @differentiable(wrt: (self, inputs))
+    public func lastOutput(from inputs: [Cell.TimeStepInput]) -> Cell.TimeStepOutput {
+        precondition(!inputs.isEmpty, "inputs cannot be empty")
+        return self(inputs, initialState: cell.zeroState).last!
+    }
+    */
+}
+
+extension RNN: Equatable where Cell: Equatable {}
+extension RNN: AdditiveArithmetic where Cell: AdditiveArithmetic {}
+extension RNN: VectorNumeric where Cell: VectorNumeric {}
+
+public typealias SimpleRNN<Scalar: TensorFlowFloatingPoint> = RNN<SimpleRNNCell<Scalar>>
+public typealias LSTM<Scalar: TensorFlowFloatingPoint> = RNN<LSTMCell<Scalar>>
